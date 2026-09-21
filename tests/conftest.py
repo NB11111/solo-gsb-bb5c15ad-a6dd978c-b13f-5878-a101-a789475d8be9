@@ -31,6 +31,9 @@ def clean_db():
         conn.execute("DELETE FROM snapshot_corrections")
         conn.execute("DELETE FROM snapshot_items")
         conn.execute("DELETE FROM snapshots")
+        # consumer_leases 先于 consumers 删除（外键）
+        conn.execute("DELETE FROM consumer_leases")
+        conn.execute("DELETE FROM consumers")
         conn.execute("DELETE FROM corrections")
         conn.execute("DELETE FROM finalized")
         conn.execute("DELETE FROM fragments")

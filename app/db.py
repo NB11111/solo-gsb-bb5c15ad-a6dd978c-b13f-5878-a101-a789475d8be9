@@ -165,6 +165,34 @@ BEFORE DELETE ON snapshot_corrections
 BEGIN
     SELECT RAISE(ABORT, 'snapshot_corrections are immutable: DELETE is forbidden');
 END;
+
+-- 命名消费者拉取游标：每个 (channel, consumer) 一行。
+-- cursor = 该消费者已确认的最后一个序号（从 0 起），只能经确认接口向前推进。
+CREATE TABLE IF NOT EXISTS consumers (
+    channel    TEXT NOT NULL,
+    consumer   TEXT NOT NULL,
+    cursor     INTEGER NOT NULL DEFAULT 0 CHECK (cursor >= 0),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (channel, consumer)
+);
+
+-- 消费者租约：每次领取在同一事务内签发一行。
+-- confirmed_at / confirmed_cursor 为 NULL 表示尚未确认；过期未确认的租约
+-- 行保留不删——它既是旧令牌被拒（409）的依据，也留下完整领取历史。
+-- 游标推进时在同一事务内回填 confirmed_*，租约随即被视为已消费，不可再用。
+CREATE TABLE IF NOT EXISTS consumer_leases (
+    channel          TEXT NOT NULL,
+    consumer         TEXT NOT NULL,
+    lease_token      TEXT NOT NULL,
+    start_seq        INTEGER NOT NULL CHECK (start_seq >= 1),
+    end_seq          INTEGER NOT NULL CHECK (end_seq >= start_seq),
+    expires_at       TEXT NOT NULL,
+    confirmed_cursor INTEGER,
+    confirmed_at     TEXT,
+    created_at       TEXT NOT NULL,
+    PRIMARY KEY (channel, consumer, lease_token),
+    FOREIGN KEY (channel, consumer) REFERENCES consumers (channel, consumer)
+);
 """
 
 _lock = threading.RLock()

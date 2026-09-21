@@ -6,6 +6,8 @@ services:
       - "8000:8000"
     environment:
       DB_PATH: /data/subtitles.db
+      # 消费者拉取租约有效期（秒）：到期未确认的批次可被同一消费者重新领取
+      LEASE_TTL_SECONDS: "30"
     volumes:
       - subtitles-data:/data
     restart: unless-stopped

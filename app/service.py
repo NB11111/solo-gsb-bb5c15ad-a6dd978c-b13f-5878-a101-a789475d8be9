@@ -25,10 +25,27 @@
   冻结，始终返回原 snapshot_id；此后新定稿、新更正、新缺口只写入
   原表，任何既有快照内容都不随之改变；
 - 不存在的频道也可创建 watermark=0 的空快照（不创建频道行）。
+
+命名消费者拉取游标（consumers/consumer_leases）不变式：
+- 每个 (channel, consumer) 持有一个已确认游标 cursor（从 0 起），
+  领取在单个 BEGIN IMMEDIATE 事务内“读取游标 -> 判定最近租约状态 ->
+  签发新租约并返回 cursor+1 起的连续批次（字幕与缺口标记混合）”，
+  未过期且未确认的租约存续期间同一消费者不得重复领取（409
+  lease_active），不改写任何状态；
+- 确认必须同时通过 lease_token 与 expected_cursor 校验，且推进目标
+  必须严格落在本批次 (start_seq, end_seq] 内；旧/已消费/过期令牌、
+  游标不匹配、越界、并发落后请求一律 409 且不产生任何写入；
+- 租约到期后旧令牌即刻失效（409 lease_expired），允许在同一事务内
+  把未确认批次以新租约重新签发给同一消费者（从当前已确认游标之后
+  开始）；部分确认后租约在有效期内仍可继续确认剩余序号，到期未确认
+  完则可重新领取剩余批次。
 """
 
+import os
+import secrets
 import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from .db import read_tx, write_tx
 
@@ -47,6 +64,16 @@ class SnapshotError(Exception):
     """快照分页 / 审计请求在业务前置条件上被拒绝；HTTP 层映射为 404/409。"""
 
     def __init__(self, error: str, message: str, status_code: int = 404):
+        super().__init__(message)
+        self.error = error
+        self.message = message
+        self.status_code = status_code
+
+
+class LeaseError(Exception):
+    """消费者领取 / 确认请求在业务前置条件上被拒绝；HTTP 层映射为 409/404。"""
+
+    def __init__(self, error: str, message: str, status_code: int = 409):
         super().__init__(message)
         self.error = error
         self.message = message
@@ -782,4 +809,289 @@ def list_snapshot_corrections(snapshot_id: str, seq: int) -> dict:
                 }
                 for row in rows
             ],
+        }
+
+
+# ---------- 命名消费者拉取游标与租约 ----------
+
+
+def lease_ttl_seconds() -> float:
+    """租约有效期（秒），由环境变量 LEASE_TTL_SECONDS 配置，默认 30 秒。"""
+    return float(os.environ.get("LEASE_TTL_SECONDS", "30"))
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_str(dt: datetime) -> str:
+    """统一 UTC ISO8601（毫秒，Z 结尾），与 SQLite 建表默认时间格式一致。"""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _lease_status(row, now: datetime) -> str:
+    """租约状态：confirmed=已完整确认；expired=过期未确认；active=未过期未完整确认（含部分确认）。
+
+    到期时刻在签发时按当时的 TTL 固化（expires_at 列），之后即使调整
+    LEASE_TTL_SECONDS 也不会让在途租约提前/延后到期。
+    """
+    if row["confirmed_at"] is not None:
+        return "confirmed"
+    if _parse_utc(row["expires_at"]) <= now:
+        return "expired"
+    return "active"
+
+
+def _latest_lease(conn, channel: str, consumer: str):
+    """读取某消费者最近一次领取的租约（按自增 rowid，无则 None）。"""
+    return conn.execute(
+        "SELECT * FROM consumer_leases WHERE channel = ? AND consumer = ? "
+        "ORDER BY rowid DESC LIMIT 1",
+        (channel, consumer),
+    ).fetchone()
+
+
+def claim_batch(channel: str, consumer: str, limit: int = 100) -> dict:
+    """消费者从已确认游标后领取一个连续批次（含缺口标记）并签发租约。
+
+    - “读游标 -> 检查最近租约 -> 取批次 -> 写租约”在单个 BEGIN IMMEDIATE
+      事务内完成，并发领取被串行化；
+    - 最近租约仍有效（未过期且未完整确认，允许已有部分确认进度）时拒绝
+      重复领取（409 lease_active），不产生任何写入；过期租约不修改、不
+      删除，只作为旧令牌失效的凭据；
+    - 游标之后暂无可领取序号时返回 items=[] 且不签发租约。
+    """
+    now = _now_utc()
+    with write_tx() as conn:
+        row = conn.execute(
+            "SELECT cursor FROM consumers WHERE channel = ? AND consumer = ?",
+            (channel, consumer),
+        ).fetchone()
+        cursor = row["cursor"] if row else 0
+
+        latest = _latest_lease(conn, channel, consumer)
+        if latest is not None and _lease_status(latest, now) == "active":
+            raise LeaseError(
+                "lease_active",
+                f"消费者 {consumer} 在频道 {channel} 上仍持有未过期且未完整"
+                f"确认的租约 (token 尾号 ...{latest['lease_token'][-8:]})，"
+                "请先确认到批次末位或等待租约到期",
+            )
+
+        watermark = conn.execute(
+            "SELECT watermark FROM channels WHERE channel = ?", (channel,)
+        ).fetchone()
+        watermark = watermark["watermark"] if watermark else 0
+
+        items = _fetch_finalized_items(conn, channel, after=cursor, limit=limit)
+
+        # 首次领取时惰性注册消费者；游标仍为 0 也保留注册记录供状态查询
+        conn.execute(
+            "INSERT INTO consumers (channel, consumer, cursor) VALUES (?, ?, 0) "
+            "ON CONFLICT(channel, consumer) DO NOTHING",
+            (channel, consumer),
+        )
+
+        if not items:
+            return {
+                "channel": channel,
+                "consumer": consumer,
+                "cursor": cursor,
+                "watermark": watermark,
+                "lease_token": None,
+                "expires_at": None,
+                "start_seq": None,
+                "end_seq": None,
+                "limit": limit,
+                "items": [],
+            }
+
+        start_seq = cursor + 1
+        end_seq = items[-1]["seq"]
+        issued_at = now
+        expires_at = now + timedelta(seconds=lease_ttl_seconds())
+        issued_at_str = _utc_str(issued_at)
+        expires_at_str = _utc_str(expires_at)
+        lease_token = secrets.token_urlsafe(32)
+
+        conn.execute(
+            "INSERT INTO consumer_leases "
+            "(channel, consumer, lease_token, start_seq, end_seq, expires_at, "
+            " confirmed_cursor, confirmed_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+            (
+                channel, consumer, lease_token, start_seq, end_seq,
+                expires_at_str, issued_at_str,
+            ),
+        )
+
+        return {
+            "channel": channel,
+            "consumer": consumer,
+            "cursor": cursor,
+            "watermark": watermark,
+            "lease_token": lease_token,
+            "expires_at": expires_at_str,
+            "start_seq": start_seq,
+            "end_seq": end_seq,
+            "limit": limit,
+            "items": items,
+        }
+
+
+def confirm_batch(
+    channel: str, consumer: str, lease_token: str, expected_cursor: int
+) -> dict:
+    """确认消费者已处理下一个序号，把已确认游标推进到 expected_cursor+1。
+
+    一个租约覆盖一整个批次，可在有效期内逐条确认：每次调用游标 +1，
+    直到推进到 end_seq 时租约完整消费（回填 confirmed_at）。所有前置
+    校验先于任何写入执行：
+    - lease_token 必须是该消费者最近一次领取的令牌（未知/旧令牌 409）；
+    - 租约已完整确认 -> 409 lease_consumed；已过期 -> 409 lease_expired；
+    - expected_cursor 必须等于服务端当前已确认游标（落后/超前的并发
+      请求 409 cursor_conflict）；
+    - 推进目标 expected_cursor+1 必须 <= end_seq（越界 409
+      cursor_out_of_batch）。
+    """
+    now = _now_utc()
+    with write_tx() as conn:
+        crow = conn.execute(
+            "SELECT cursor FROM consumers WHERE channel = ? AND consumer = ?",
+            (channel, consumer),
+        ).fetchone()
+        if crow is None:
+            raise LeaseError(
+                "consumer_not_found",
+                f"消费者 {consumer} 在频道 {channel} 上不存在，请先领取批次",
+                status_code=404,
+            )
+        current_cursor = crow["cursor"]
+
+        lease = conn.execute(
+            "SELECT * FROM consumer_leases "
+            "WHERE channel = ? AND consumer = ? AND lease_token = ?",
+            (channel, consumer, lease_token),
+        ).fetchone()
+        if lease is None:
+            raise LeaseError(
+                "invalid_lease_token",
+                "lease_token 无效或不属于该消费者",
+            )
+
+        # 只有最近一次租约允许确认：过期后重新领取会让旧令牌落到这里
+        latest = _latest_lease(conn, channel, consumer)
+        if latest["lease_token"] != lease_token:
+            raise LeaseError(
+                "lease_superseded",
+                "该 lease_token 已被更新的领取取代（旧租约不可再确认）",
+            )
+
+        if _lease_status(lease, now) == "confirmed":
+            raise LeaseError(
+                "lease_consumed",
+                "该租约已完整确认，不能重复确认",
+            )
+
+        if _lease_status(lease, now) == "expired":
+            raise LeaseError(
+                "lease_expired",
+                "lease_token 已过期，请重新领取未确认批次",
+            )
+
+        if expected_cursor != current_cursor:
+            raise LeaseError(
+                "cursor_conflict",
+                f"expected_cursor={expected_cursor} 与服务端已确认游标 "
+                f"{current_cursor} 不一致",
+            )
+
+        new_cursor = expected_cursor + 1
+        # 游标在领取时等于 start_seq-1 且只增不减，下界天然成立；
+        # 只需拒绝推进到批次末位之后
+        if new_cursor > lease["end_seq"]:
+            raise LeaseError(
+                "cursor_out_of_batch",
+                f"推进目标 {new_cursor} 超出本批次末位 {lease['end_seq']}",
+            )
+
+        fully_confirmed = new_cursor == lease["end_seq"]
+        confirmed_at_str = _utc_str(now) if fully_confirmed else None
+        # 租约确认信息与消费者游标推进必须在同一事务内原子完成；
+        # 部分确认只回填 confirmed_cursor 展示进度，confirmed_at 保持 NULL，
+        # 租约仍可在有效期内继续确认剩余序号
+        conn.execute(
+            "UPDATE consumer_leases SET confirmed_cursor = ?, confirmed_at = ? "
+            "WHERE channel = ? AND consumer = ? AND lease_token = ?",
+            (new_cursor, confirmed_at_str, channel, consumer, lease_token),
+        )
+        conn.execute(
+            "UPDATE consumers SET cursor = ? WHERE channel = ? AND consumer = ?",
+            (new_cursor, channel, consumer),
+        )
+
+        watermark_row = conn.execute(
+            "SELECT watermark FROM channels WHERE channel = ?", (channel,)
+        ).fetchone()
+        watermark = watermark_row["watermark"] if watermark_row else 0
+
+        return {
+            "channel": channel,
+            "consumer": consumer,
+            "cursor": new_cursor,
+            "watermark": watermark,
+            "lease_token": lease_token,
+            "fully_confirmed": fully_confirmed,
+            "confirmed_at": confirmed_at_str,
+        }
+
+
+def get_consumer_status(channel: str, consumer: str) -> dict:
+    """查询消费者的已确认游标、频道水位线与最近租约状态。"""
+    now = _now_utc()
+    with read_tx() as conn:
+        crow = conn.execute(
+            "SELECT cursor, created_at FROM consumers "
+            "WHERE channel = ? AND consumer = ?",
+            (channel, consumer),
+        ).fetchone()
+        if crow is None:
+            raise LeaseError(
+                "consumer_not_found",
+                f"消费者 {consumer} 在频道 {channel} 上不存在",
+                status_code=404,
+            )
+
+        watermark_row = conn.execute(
+            "SELECT watermark FROM channels WHERE channel = ?", (channel,)
+        ).fetchone()
+        watermark = watermark_row["watermark"] if watermark_row else 0
+        cursor = crow["cursor"]
+
+        lease = _latest_lease(conn, channel, consumer)
+        lease_info = None
+        if lease is not None:
+            lease_info = {
+                "lease_token": lease["lease_token"],
+                "status": _lease_status(lease, now),
+                "start_seq": lease["start_seq"],
+                "end_seq": lease["end_seq"],
+                "expires_at": lease["expires_at"],
+                "confirmed_cursor": lease["confirmed_cursor"],
+                "confirmed_at": lease["confirmed_at"],
+                "created_at": lease["created_at"],
+            }
+
+        return {
+            "channel": channel,
+            "consumer": consumer,
+            "cursor": cursor,
+            "watermark": watermark,
+            "lag": max(watermark - cursor, 0),
+            "created_at": crow["created_at"],
+            "latest_lease": lease_info,
         }

@@ -7,6 +7,10 @@ from fastapi.responses import JSONResponse
 from . import service
 from .db import init_db
 from .schemas import (
+    ClaimResponse,
+    ConfirmIn,
+    ConfirmResponse,
+    ConsumerStatusResponse,
     CorrectionAuditResponse,
     CorrectionIn,
     CorrectionResponse,
@@ -35,8 +39,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Live Subtitle Finalizer",
     summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
-    "支持追加式更正与不可变发布快照",
-    version="1.2.0",
+    "支持追加式更正、不可变发布快照与命名消费者租约式拉取游标",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -51,6 +55,14 @@ def correction_error_handler(request, exc: service.CorrectionError) -> JSONRespo
 
 @app.exception_handler(service.SnapshotError)
 def snapshot_error_handler(request, exc: service.SnapshotError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.error, "message": exc.message},
+    )
+
+
+@app.exception_handler(service.LeaseError)
+def lease_error_handler(request, exc: service.LeaseError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.error, "message": exc.message},
@@ -184,3 +196,77 @@ def get_snapshot_items(
 def list_snapshot_corrections(snapshot_id: str, seq: int) -> dict:
     """查询快照内某字幕序号在快照时刻冻结的全部更正版本（按 version 升序）。"""
     return service.list_snapshot_corrections(snapshot_id, seq)
+
+
+# ---------- 命名消费者拉取游标与租约 ----------
+
+
+@app.post(
+    "/channels/{channel}/consumers/{consumer}/claims",
+    response_model=ClaimResponse,
+    status_code=200,
+    responses={
+        409: {"description": "该消费者仍持有未过期且未确认的租约", "model": ErrorResponse},
+        422: {"description": "limit 越界等请求参数校验失败"},
+    },
+)
+def claim_batch(
+    channel: str,
+    consumer: str,
+    limit: int = Query(
+        100, ge=1, le=10000, description="本批最多返回的条目数（字幕与缺口标记统一计数）"
+    ),
+) -> dict:
+    """消费者从已确认游标后领取连续批次（含缺口标记）并获得带过期时间的租约。
+
+    - 整个“读游标 -> 检查最近租约 -> 返回批次 -> 签发 lease_token”过程在
+      单个 `BEGIN IMMEDIATE` 事务内完成；
+    - 未过期且未确认的租约存续期间，同一消费者重复领取得到 409
+      `lease_active`，服务不改写任何状态；
+    - 租约到期后允许重新领取同一未确认批次（旧令牌失效）；
+    - 游标之后暂无可领取序号时返回空 `items` 且不签发租约（`lease_token=null`）。
+    """
+    return service.claim_batch(channel, consumer, limit=limit)
+
+
+@app.post(
+    "/channels/{channel}/consumers/{consumer}/claims/confirm",
+    response_model=ConfirmResponse,
+    status_code=200,
+    responses={
+        404: {"description": "消费者不存在（从未领取）", "model": ErrorResponse},
+        409: {
+            "description": (
+                "lease_token 无效/过期/已消费/被新领取取代，或 expected_cursor "
+                "与服务端游标不一致，或推进目标超出本批次范围；任何失败都不改写状态"
+            ),
+            "model": ErrorResponse,
+        },
+        422: {"description": "请求体校验失败（lease_token 为空、expected_cursor<0 等）"},
+    },
+)
+def confirm_batch(channel: str, consumer: str, body: ConfirmIn) -> dict:
+    """确认已处理下一个序号，把消费者游标推进到 expected_cursor+1。
+
+    - 必须同时通过 `lease_token` 与 `expected_cursor` 校验，只允许把游标
+      推进到该批次 `[start_seq, end_seq]` 内的序号；租约有效期内可逐条
+      确认，推进到 end_seq 时租约完整消费；
+    - 过期令牌、旧令牌（已被重新领取取代）、已完整消费的令牌、越界
+      推进或并发落后的请求（expected_cursor 与服务端不一致）一律返回
+      409，且不改写任何状态；
+    - 租约到期后允许重新领取同一未确认批次（从当前已确认游标之后开始），
+      确认成功后下一次领取从新游标继续。
+    """
+    return service.confirm_batch(
+        channel, consumer, body.lease_token, body.expected_cursor
+    )
+
+
+@app.get(
+    "/channels/{channel}/consumers/{consumer}/status",
+    response_model=ConsumerStatusResponse,
+    responses={404: {"description": "消费者不存在（从未领取）", "model": ErrorResponse}},
+)
+def get_consumer_status(channel: str, consumer: str) -> dict:
+    """查询命名消费者状态：已确认游标、频道水位线、落后量与最近租约状态。"""
+    return service.get_consumer_status(channel, consumer)

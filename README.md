@@ -1,6 +1,6 @@
 # Live Subtitle Finalizer — 直播字幕定稿服务
 
-基于 FastAPI + SQLite 的直播字幕定稿服务。客户端按频道提交带**序号 / 修订号 / 文本**的字幕片段，服务将乱序到达的片段放入缓冲区，只从序号 1 起按**连续前缀**推进水位线并生成**不可再修改**的定稿字幕。操作员可对确认永久丢失的序号区间发起**缺口裁决**，服务在同一事务中记录缺口并释放紧随其后的连续缓冲片段。定稿之后如需改字，可通过**追加式更正层**提交不可变的更正版本——原始定稿永远保留，下游可在原始视图与生效视图之间选择。需要让下游分批拉取**同一时刻的稳定字幕**时，可对频道**发布快照**：单事务锁定水位线并冻结 1..watermark 的原始 / 生效结果、缺口标记与各条更正版本，此后任何定稿、更正或缺口都不会改变既有快照。
+基于 FastAPI + SQLite 的直播字幕定稿服务。客户端按频道提交带**序号 / 修订号 / 文本**的字幕片段，服务将乱序到达的片段放入缓冲区，只从序号 1 起按**连续前缀**推进水位线并生成**不可再修改**的定稿字幕。操作员可对确认永久丢失的序号区间发起**缺口裁决**，服务在同一事务中记录缺口并释放紧随其后的连续缓冲片段。定稿之后如需改字，可通过**追加式更正层**提交不可变的更正版本——原始定稿永远保留，下游可在原始视图与生效视图之间选择。需要让下游分批拉取**同一时刻的稳定字幕**时，可对频道**发布快照**：单事务锁定水位线并冻结 1..watermark 的原始 / 生效结果、缺口标记与各条更正版本，此后任何定稿、更正或缺口都不会改变既有快照。**命名消费者**还可通过带过期时间的**租约（lease）**从各自的已确认游标后拉取连续批次（含缺口标记），服务端事务化保证未过期批次不会重复发放、确认必须同时校验 `lease_token` 与 `expected_cursor`，租约到期后未确认批次可重新领取。
 
 ## 语义规则
 
@@ -35,6 +35,16 @@
 - 不存在的频道也可创建 `watermark=0` 的空快照（不创建频道行）；之后可分页拉到空列表。
 - 快照表只追加，存储层触发器禁止任何 `UPDATE` / `DELETE`。
 
+### 命名消费者拉取游标与租约规则
+
+- 每个 `(channel, consumer)` 拥有独立的**已确认游标** `cursor`（从 0 起）；领取在单个 `BEGIN IMMEDIATE` 事务内完成「读游标 → 检查最近租约 → 返回 `cursor+1` 起的连续批次 → 签发 `lease_token`」，批次中字幕与缺口标记按序号混合返回，`limit`（默认 100，1..10000）截断本批条目数。
+- **未过期且未完整确认的租约存续期间，同一消费者不得重复领取**：重复调用返回 409 `lease_active` 且不改写任何状态（不同消费者互不影响，各自持有独立租约与游标）。
+- 确认接口必须**同时校验** `lease_token` 与 `expected_cursor`：每次确认把游标推进 `expected_cursor+1`，且推进点必须落在该批次 `[start_seq, end_seq]` 之内；可在租约有效期内逐条确认，直到批次末位（`fully_confirmed=true`）。
+- **过期令牌、旧令牌（过期后重新领取产生了新租约）、已完整消费的令牌、越界推进、并发落后请求**（`expected_cursor` 与服务端游标不一致）一律返回 409 且**不改写任何状态**。
+- 租约到期后旧令牌立即失效（409 `lease_expired`），允许在同一事务中**重新领取同一未确认批次**（从当前已确认游标之后开始）；确认成功后下一次领取从新游标继续。
+- 游标之后暂无可领取序号时返回空 `items` 且不签发租约（`lease_token=null`）；领取之后新到达并定稿的序号不影响在途租约，下一次领取才可见。
+- 租约 TTL 由环境变量 `LEASE_TTL_SECONDS` 配置（默认 30 秒），到期时刻在签发时固化。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -53,12 +63,16 @@ docker compose up --build
 - 创建发布快照：`POST /channels/{channel}/snapshots`
 - 分页拉取快照（`view=original|effective`）：`GET /snapshots/{snapshot_id}/items`
 - 快照内更正历史（版本升序）：`GET /snapshots/{snapshot_id}/items/{seq}/corrections`
+- 消费者领取批次（带过期租约）：`POST /channels/{channel}/consumers/{consumer}/claims`
+- 消费者确认批次（校验 lease_token + expected_cursor）：`POST /channels/{channel}/consumers/{consumer}/claims/confirm`
+- 查询消费者状态：`GET /channels/{channel}/consumers/{consumer}/status`
 
 ## 配置
 
-| 环境变量   | 默认值                 | 说明               |
-| ---------- | ---------------------- | ------------------ |
-| `DB_PATH`  | `/data/subtitles.db`   | SQLite 数据库文件路径 |
+| 环境变量           | 默认值                 | 说明                                   |
+| ------------------ | ---------------------- | -------------------------------------- |
+| `DB_PATH`          | `/data/subtitles.db`   | SQLite 数据库文件路径                  |
+| `LEASE_TTL_SECONDS`| `30`                   | 消费者拉取租约有效期（秒），到期可重新领取未确认批次 |
 
 Compose 默认将 `/data` 挂载到命名卷 `subtitles-data`，容器重启数据不丢失。端口映射可在 `docker-compose.yml` 的 `ports` 中调整。
 
@@ -338,11 +352,117 @@ curl http://localhost:8000/snapshots/b1f3c2a4-..../items/1/corrections
 | 404    | `seq_out_of_snapshot`  | 序号小于 1 或超出快照锁定的 watermark（空快照全部越界）    |
 | 409    | `seq_is_gap`           | 该序号在快照中是永久缺口，缺口没有更正历史                 |
 
+### 消费者领取批次（租约式拉取）
+
+下游消费者以名称（`consumer`）在频道上独立维护已确认游标。领取时服务在事务内从该消费者已确认游标之后返回一个按序号升序的**连续批次**（字幕与缺口标记混合，结构与定稿查询一致），并签发一个带过期时间的 `lease_token`：
+
+```bash
+curl -X POST 'http://localhost:8000/channels/news/consumers/dlq-worker/claims?limit=100'
+```
+
+```json
+{
+  "channel": "news",
+  "consumer": "dlq-worker",
+  "cursor": 0,
+  "watermark": 6,
+  "lease_token": "vL19lX85R-zmdVbHfL0YqRsJzxrE3DqNtQQncri_LI8",
+  "expires_at": "2026-09-21T12:00:30.000Z",
+  "start_seq": 1,
+  "end_seq": 6,
+  "limit": 100,
+  "items": [
+    {"kind": "subtitle", "seq": 1, "revision": 1, "text": "第一条字幕", "start_seq": null, "end_seq": null},
+    {"kind": "gap",      "seq": 3, "revision": null, "text": null, "start_seq": 3, "end_seq": 4},
+    {"kind": "subtitle", "seq": 6, "revision": 1, "text": "第六条字幕", "start_seq": null, "end_seq": null}
+  ]
+}
+```
+
+规则：
+
+- `cursor` 是领取时该消费者的已确认游标，`start_seq = cursor + 1`，`end_seq` 为本批末个序号；`limit`（1..10000，默认 100）截断本批条目数；
+- **未过期且未完整确认的租约存续期间，同一消费者重复领取得到 409 `lease_active`**，服务不改写任何状态；不同消费者各自持有独立租约，互不阻塞；
+- 游标之后暂无可领取序号（已追上频道水位线）时返回 `"items": []`、`lease_token=null`，且不写租约；
+- 领取之后新定稿的序号不改变在途租约，下一次领取才可见。
+
+### 确认批次
+
+处理完一个序号后调用确认接口，游标按 `expected_cursor+1` 推进。必须同时携带领取时签发的 `lease_token` 与服务端当前游标：
+
+```bash
+curl -X POST http://localhost:8000/channels/news/consumers/dlq-worker/claims/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"lease_token": "vL19lX85R-zmdVbHfL0YqRsJzxrE3DqNtQQncri_LI8", "expected_cursor": 0}'
+```
+
+```json
+{
+  "channel": "news",
+  "consumer": "dlq-worker",
+  "cursor": 1,
+  "watermark": 6,
+  "lease_token": "vL19lX85R-zmdVbHfL0YqRsJzxrE3DqNtQQncri_LI8",
+  "fully_confirmed": false,
+  "confirmed_at": null
+}
+```
+
+- 每次确认只推进一个序号：继续确认时 `expected_cursor` 依次传 `1, 2, 3, …`；`fully_confirmed=false` / `confirmed_at=null` 表示批次尚未完整确认，租约在有效期内可继续使用；
+- 推进到批次 `end_seq` 时 `fully_confirmed=true` 并回填 `confirmed_at`，租约完整消费，下一次领取从新游标继续；
+- 「校验令牌与游标 → 回填租约确认信息 → 推进消费者游标」在单个 `BEGIN IMMEDIATE` 事务内原子完成，竞争请求中恰好一个成功。
+
+409 / 404 响应体：
+
+| 状态码 | `error`                 | 含义                                                                 |
+| ------ | ----------------------- | -------------------------------------------------------------------- |
+| 409    | `lease_active`          | 领取时仍持有未过期且未完整确认的租约，不得重复领取                   |
+| 409    | `invalid_lease_token`   | 令牌不存在或不属于该消费者                                           |
+| 409    | `lease_superseded`      | 令牌属于旧租约，已被过期后的重新领取取代                             |
+| 409    | `lease_expired`         | 租约已到期（重新领取未确认批次后再确认）                             |
+| 409    | `lease_consumed`        | 租约已完整确认，不能重复确认                                         |
+| 409    | `cursor_conflict`       | `expected_cursor` 与服务端已确认游标不一致（并发落后/超前请求）      |
+| 409    | `cursor_out_of_batch`   | 推进目标 `expected_cursor+1` 超出本批次 `end_seq`                    |
+| 404    | `consumer_not_found`    | 消费者不存在（从未领取）                                             |
+
+租约到期后的典型恢复流程：确认得到 409 `lease_expired` → 重新调用领取接口拿到新 `lease_token`（批次从未确认游标之后重新开始，已确认过的序号不会重复发放）→ 用新令牌继续确认。
+
+### 查询消费者状态
+
+```bash
+curl http://localhost:8000/channels/news/consumers/dlq-worker/status
+```
+
+```json
+{
+  "channel": "news",
+  "consumer": "dlq-worker",
+  "cursor": 2,
+  "watermark": 6,
+  "lag": 4,
+  "created_at": "2026-09-21T11:58:00.000Z",
+  "latest_lease": {
+    "lease_token": "vL19lX85R-....",
+    "status": "active",
+    "start_seq": 3,
+    "end_seq": 6,
+    "expires_at": "2026-09-21T12:01:30.000Z",
+    "confirmed_cursor": null,
+    "confirmed_at": null,
+    "created_at": "2026-09-21T12:01:00.000Z"
+  }
+}
+```
+
+- `cursor` 为已确认游标，`watermark` 为频道当前水位线，`lag = watermark - cursor` 表示落后量；
+- `latest_lease.status`：`active`（未过期且未完整确认，可能已有部分确认进度）、`expired`（到期未完整确认，可重新领取）、`confirmed`（已完整确认）；
+- 从未领取过的消费者返回 404 `consumer_not_found`。
+
 ## 本地开发与测试
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                     # 含乱序、修订竞争、缺口裁决、幂等/重叠、更正版本冲突、视图合并、审计、发布快照冻结/幂等/分页/不可变、并发事务等用例
+pytest                     # 含乱序、修订竞争、缺口裁决、幂等/重叠、更正版本冲突、视图合并、审计、发布快照冻结/幂等/分页/不可变、消费者租约领取/确认/过期/并发等用例
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -353,5 +473,6 @@ uvicorn app.main:app --reload --port 8000
 - **缺口存储**：`gap_decisions` 记录每次裁决区间及其当时释放到的序号（用于幂等返回原结果），`gaps` 按被跳过序号逐行落表，定稿查询用 `UNION ALL` 按序合并字幕与缺口标记。
 - **追加式更正层**：`corrections(channel, seq, version, text, reason, created_at)` 仅通过 `INSERT` 追加，`(channel, seq)` 外键引用 `finalized`——缺口或未定稿序号在存储层即无法插入；版本号按序号从 1 递增，`expected_version` 乐观并发控制 + `BEGIN IMMEDIATE` 保证竞争下唯一成功；`corrections_no_update` / `corrections_no_delete` 触发器在存储层禁止任何改写与删除，原始定稿保持不可变。生效视图用相关子查询连接每个序号的最新版本（`MAX(version)`）合并文本，审计查询按 `version` 升序返回完整历史。
 - **发布快照**：`snapshots(snapshot_id, channel, watermark, idempotency_key, created_at)` 记录冻结时刻，`snapshot_items(snapshot_id, seq, …)` 对 `1..watermark` 每个序号落一行——字幕行同时存 `original_text`、创建时刻经 `MAX(version)` 连接冻结的 `effective_text` 及其 `correction_version`，缺口行存裁决区间端点；`snapshot_corrections(snapshot_id, seq, version, …)` 逐版本复制快照时刻已有的全部更正记录。创建先按 `(channel, idempotency_key)` 查重，命中即幂等返回；全部插入在一个写事务内完成，故冻结视图与锁定水位线严格一致。三张快照表各自配备 `no_update` / `no_delete` 触发器，快照一旦生成在存储层即不可变；分页与快照内审计只读取快照表，后续定稿、更正、缺口对其零影响。不存在的频道不写 `channels` 行，直接生成 `watermark=0` 的空快照。
-- **存储**：`channels`（水位线）、`fragments`（待定稿缓冲）、`finalized`（定稿，不可变）、`gap_decisions` / `gaps`（永久缺口）、`corrections`（追加式更正）、`snapshots` / `snapshot_items` / `snapshot_corrections`（不可变发布快照）九张表；WAL 模式 + `busy_timeout`。建表语句与触发器均幂等（`CREATE TABLE/TRIGGER IF NOT EXISTS`），已部署实例重启后自动补建新表与触发器，原有数据与接口行为不受影响。
+- **命名消费者租约**：`consumers(channel, consumer, cursor, created_at)` 保存每个消费者的已确认游标；`consumer_leases(channel, consumer, lease_token, start_seq, end_seq, expires_at, confirmed_cursor, confirmed_at, created_at)` 每次领取追加一行，`lease_token` 为 256 位随机令牌，到期时刻在签发时按 `LEASE_TTL_SECONDS` 固化。领取路径在单个 `BEGIN IMMEDIATE` 事务内检查最近租约（按自增 rowid）：未过期且未完整确认即 409 `lease_active`，过期则保留旧行（旧令牌确认时得到 409 `lease_expired` / `lease_superseded`）并签发新租约；批次内容复用定稿查询的字幕/缺口合并逻辑。确认路径所有校验（令牌归属与新旧、`confirmed_at`、到期时间、`expected_cursor == cursor`、`cursor+1 <= end_seq`）全部先于任何写入执行，随后在同一事务内回填租约确认信息并推进消费者游标；部分确认只更新 `confirmed_cursor` 展示进度，`confirmed_at` 仅在推进到批次末位时写入。
+- **存储**：`channels`（水位线）、`fragments`（待定稿缓冲）、`finalized`（定稿，不可变）、`gap_decisions` / `gaps`（永久缺口）、`corrections`（追加式更正）、`snapshots` / `snapshot_items` / `snapshot_corrections`（不可变发布快照）、`consumers` / `consumer_leases`（消费者游标与领取租约）十一张表；WAL 模式 + `busy_timeout`。建表语句与触发器均幂等（`CREATE TABLE/TRIGGER IF NOT EXISTS`），已部署实例重启后自动补建新表与触发器，原有数据与接口行为不受影响。
 - **容器化**：`docker compose up --build` 一键启动，数据库落在命名卷 `subtitles-data`；服务固定监听 **8000** 端口。

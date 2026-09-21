@@ -262,3 +262,94 @@ class SnapshotCorrectionsResponse(BaseModel):
     items: List[SnapshotCorrectionItem] = Field(
         ..., description="快照冻结的该序号全部更正记录，按 version 升序"
     )
+
+
+# ---------- 命名消费者拉取游标与租约 ----------
+
+
+class ClaimResponse(BaseModel):
+    channel: str
+    consumer: str
+    cursor: int = Field(
+        ..., description="领取时该消费者的已确认游标（本批序号均大于该值）"
+    )
+    watermark: int = Field(..., description="领取时频道水位线，cursor<watermark 表示尚有落后")
+    lease_token: Optional[str] = Field(
+        None,
+        description=(
+            "本次批次的租约令牌（确认时必须原样回传）；"
+            "游标之后暂无可领取序号时为 null，且不签发租约"
+        ),
+    )
+    expires_at: Optional[str] = Field(
+        None, description="租约到期时间（UTC ISO8601）；无批次时为 null"
+    )
+    start_seq: Optional[int] = Field(None, description="本批次首个序号（=领取时 cursor+1）")
+    end_seq: Optional[int] = Field(None, description="本批次末个序号")
+    limit: int = Field(..., description="本次领取允许返回的最大条目数")
+    items: List[FinalizedItem] = Field(
+        default_factory=list,
+        description="按序号升序连续返回的字幕与缺口标记，游标之后无新定稿时为空",
+    )
+
+
+class ConfirmIn(BaseModel):
+    lease_token: str = Field(..., min_length=1, description="领取接口签发的租约令牌")
+    expected_cursor: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "客户端认为的当前已确认游标：必须与服务端一致，"
+            "确认成功后游标推进 expected_cursor+1；可在租约有效期内"
+            "逐条确认直到批次末位"
+        ),
+    )
+
+    @field_validator("lease_token")
+    @classmethod
+    def _strip_and_require_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不得为空白字符串")
+        return v
+
+
+class ConfirmResponse(BaseModel):
+    channel: str
+    consumer: str
+    cursor: int = Field(..., description="确认后的新已确认游标")
+    watermark: int = Field(..., description="确认时频道水位线")
+    lease_token: str = Field(..., description="本次确认消费的租约令牌")
+    fully_confirmed: bool = Field(
+        ..., description="true=游标已推进到批次末位，租约完整消费；false=部分确认，租约有效期内可继续确认剩余序号"
+    )
+    confirmed_at: Optional[str] = Field(
+        None,
+        description="完整确认时间（UTC ISO8601）；部分确认（游标未到批次末位）时为 null",
+    )
+
+
+class LeaseInfo(BaseModel):
+    lease_token: str = Field(..., description="租约令牌")
+    status: Literal["active", "expired", "confirmed"] = Field(
+        ...,
+        description="active=未过期且未完整确认（含仅部分确认）；expired=过期未完整确认（可重新领取剩余批次）；confirmed=已完整确认",
+    )
+    start_seq: int
+    end_seq: int
+    expires_at: str = Field(..., description="租约到期时间（UTC ISO8601）")
+    confirmed_cursor: Optional[int] = Field(None, description="该租约确认后推进到的游标（未确认为 null）")
+    confirmed_at: Optional[str] = Field(None, description="确认时间（UTC ISO8601），未确认为 null")
+    created_at: str = Field(..., description="租约签发时间（UTC ISO8601）")
+
+
+class ConsumerStatusResponse(BaseModel):
+    channel: str
+    consumer: str
+    cursor: int = Field(..., description="已确认游标（最后确认到的序号，0 表示尚未确认任何序号）")
+    watermark: int = Field(..., description="频道当前水位线")
+    lag: int = Field(..., description="落后量 = watermark - cursor（不为负）")
+    created_at: str = Field(..., description="消费者首次领取注册时间（UTC ISO8601）")
+    latest_lease: Optional[LeaseInfo] = Field(
+        None, description="最近一次领取的租约及其状态；从未领取时为 null"
+    )
