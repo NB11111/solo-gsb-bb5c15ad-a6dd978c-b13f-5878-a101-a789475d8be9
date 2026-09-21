@@ -262,3 +262,66 @@ class SnapshotCorrectionsResponse(BaseModel):
     items: List[SnapshotCorrectionItem] = Field(
         ..., description="快照冻结的该序号全部更正记录，按 version 升序"
     )
+
+
+# ---------- 命名消费者拉取游标 ----------
+
+
+class ClaimIn(BaseModel):
+    limit: int = Field(
+        100, ge=1, le=10000, description="本批次最多返回的条目数（字幕与缺口标记统一计数）"
+    )
+    lease_seconds: float = Field(
+        30.0, gt=0, le=3600, description="租约有效期（秒）；过期后同一未确认批次可被重新领取"
+    )
+
+
+class ClaimResponse(BaseModel):
+    channel: str
+    consumer: str
+    cursor: int = Field(..., description="领取时的已确认游标；本批次从 cursor+1 开始")
+    watermark: int = Field(..., description="领取时的频道水位线")
+    lease_token: Optional[str] = Field(
+        None, description="租约令牌，确认批次时回传；无新内容时为 null"
+    )
+    lease_expires_at: Optional[str] = Field(
+        None, description="租约过期时刻（UTC ISO8601）；无租约时为 null"
+    )
+    items: List[FinalizedItem] = Field(
+        default_factory=list,
+        description="已确认游标后的连续批次（字幕与缺口标记按 seq 升序混合）",
+    )
+
+
+class AckIn(BaseModel):
+    lease_token: str = Field(..., min_length=1, description="领取时签发的租约令牌")
+    expected_cursor: int = Field(
+        ..., ge=0, description="客户端认为的当前已确认游标（乐观并发控制）"
+    )
+    new_cursor: int = Field(
+        ..., ge=1, description="要推进到的序号，必须落在本批次序号范围内"
+    )
+
+
+class AckResponse(BaseModel):
+    channel: str
+    consumer: str
+    previous_cursor: int = Field(..., description="确认前的已确认游标")
+    cursor: int = Field(..., description="确认后的已确认游标（= new_cursor）")
+    watermark: int = Field(..., description="确认时的频道水位线")
+
+
+class LeaseStatus(BaseModel):
+    from_seq: int = Field(..., description="租约批次起点序号（含）")
+    to_seq: int = Field(..., description="租约批次终点序号（含）")
+    expires_at: str = Field(..., description="租约过期时刻（UTC ISO8601）")
+    expired: bool = Field(..., description="查询时刻租约是否已过期")
+
+
+class ConsumerStatusResponse(BaseModel):
+    channel: str
+    consumer: str
+    cursor: int = Field(..., description="已确认游标（初始 0）")
+    watermark: int = Field(..., description="频道当前水位线")
+    lag: int = Field(..., description="未确认条目数（watermark - cursor）")
+    lease: Optional[LeaseStatus] = Field(None, description="当前租约；无租约时为 null")

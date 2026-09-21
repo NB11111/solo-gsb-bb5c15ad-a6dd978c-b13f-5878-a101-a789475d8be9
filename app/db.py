@@ -165,6 +165,24 @@ BEFORE DELETE ON snapshot_corrections
 BEGIN
     SELECT RAISE(ABORT, 'snapshot_corrections are immutable: DELETE is forbidden');
 END;
+
+-- 命名消费者拉取游标：每个 (channel, consumer) 一行。
+-- cursor 为已确认游标（初始 0），只能经确认接口单调推进；
+-- lease_* 为当前持有的租约（无租约时全为 NULL）：lease_from..lease_to 为
+-- 领取时锁定的批次序号范围，lease_expires_at 为过期时刻（epoch 秒），
+-- 过期后同一未确认批次可被重新领取。该表是可变状态，不配不可变触发器。
+CREATE TABLE IF NOT EXISTS consumers (
+    channel          TEXT NOT NULL,
+    consumer         TEXT NOT NULL,
+    cursor           INTEGER NOT NULL DEFAULT 0,
+    lease_token      TEXT,
+    lease_from       INTEGER,
+    lease_to         INTEGER,
+    lease_expires_at REAL,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (channel, consumer)
+);
 """
 
 _lock = threading.RLock()

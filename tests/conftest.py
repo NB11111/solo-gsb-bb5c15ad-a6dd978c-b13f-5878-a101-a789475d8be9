@@ -36,6 +36,7 @@ def clean_db():
         conn.execute("DELETE FROM fragments")
         conn.execute("DELETE FROM gaps")
         conn.execute("DELETE FROM gap_decisions")
+        conn.execute("DELETE FROM consumers")
         conn.execute("DELETE FROM channels")
     init_db()
     yield
